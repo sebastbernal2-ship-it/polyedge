@@ -11,6 +11,26 @@ NAVIGATOR_KEY = os.getenv("NAVIGATOR_KEY", "")
 NAVIGATOR_BASE = "https://api.ai.it.ufl.edu/v1"
 NAVIGATOR_MODEL = "llama-3.3-70b-instruct"
 
+# ── MARKET PRIORS (CRITICAL FOR WHALE INTEGRATION) ──────────────────────
+# These are your baseline probability estimates for key markets.
+# 
+# HOW TO UPDATE FROM WHALE ALERTS:
+# ────────────────────────────────────────────────────────────────────────
+# 1. Run: python whale_monitor.py (in another terminal)
+# 2. When a whale trade alert appears, you'll see a structured LLM prompt.
+# 3. Copy that prompt into ChatGPT/Perplexity.
+# 4. The LLM will analyze the whale trade and propose a probability estimate.
+# 5. If you trust the LLM's reasoning, update the relevant prior by market ID:
+#
+#    Example: LLM says "Iran ceasefire now 45% (was 35%), whale aligned, high edge"
+#             → Update MARKET_PRIORS["0x1234..."] = 0.45
+#             → Re-run main.py to get fresh edge signals reflecting whale insight
+#
+# 6. The PolyEdge core (main.py) will use the updated prior to recalculate edge.
+#    If updated_prob = 0.45 and market_price = 0.30, edge = +0.15 (buy YES).
+#
+# For manual market IDs in the dashboard, update override_priors in dashboard/app.py
+
 DOMAIN_PRIORS = {
     "ceasefire": 0.35,
     "nuclear": 0.20,
@@ -20,6 +40,54 @@ DOMAIN_PRIORS = {
     "diplomatic": 0.40,
     "default": 0.30,
 }
+
+# ── MARKET PRIORS BY CONDITION ID ──────────────────────────────────────
+# If you prefer to set priors directly by Polymarket condition ID,
+# populate this dict. Entries here override DOMAIN_PRIORS in estimate_edge().
+# 
+# Format: market_id → probability
+# Example after whale analysis:
+#   MARKET_PRIORS["0x1234abc..."] = 0.55  # Updated from whale signal
+#
+MARKET_PRIORS = {}
+
+# Runtime overrides persisted to data/priors_overrides.json
+OVERRIDE_PRIORS = {}
+_OVERRIDES_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'data', 'priors_overrides.json'))
+
+# Load persisted overrides on import if available
+try:
+    if os.path.exists(_OVERRIDES_PATH):
+        with open(_OVERRIDES_PATH, 'r', encoding='utf-8') as _f:
+            _loaded = json.load(_f)
+            if isinstance(_loaded, dict):
+                OVERRIDE_PRIORS.update({k: float(v) for k, v in _loaded.items()})
+except Exception:
+    OVERRIDE_PRIORS = {}
+
+
+def get_effective_prior(market_id: str):
+    """Return override prior for market_id, else MARKET_PRIORS entry, else None."""
+    if not market_id:
+        return None
+    if market_id in OVERRIDE_PRIORS:
+        return OVERRIDE_PRIORS[market_id]
+    if market_id in MARKET_PRIORS:
+        return MARKET_PRIORS[market_id]
+    return None
+
+
+def set_override_prior(market_id: str, p: float):
+    """Set an override prior (in-memory + persist to data/priors_overrides.json)."""
+    try:
+        OVERRIDE_PRIORS[market_id] = float(p)
+        os.makedirs(os.path.dirname(_OVERRIDES_PATH), exist_ok=True)
+        with open(_OVERRIDES_PATH, 'w', encoding='utf-8') as _f:
+            json.dump(OVERRIDE_PRIORS, _f, indent=2)
+        return True
+    except Exception as e:
+        print(f"[WARN] Could not write priors overrides: {e}")
+        return False
 
 DOMAIN_KEYWORDS = {
     "ceasefire": ["ceasefire", "truce", "peace deal", "halt", "agreement"],
@@ -146,9 +214,21 @@ def estimate_edge(
     end_date=None,
     use_llm: bool = True,
     use_news: bool = True,
+    market_id: str = None,
 ) -> dict:
     domain = classify_domain(question)
-    prior = DOMAIN_PRIORS[domain]
+    # Prefer a market-specific effective prior if available (override persistence handled separately)
+    prior = None
+    try:
+        from model.estimator import get_effective_prior  # local import to avoid circular at module load
+        if market_id:
+            prior = get_effective_prior(market_id)
+    except Exception:
+        prior = None
+
+    if prior is None:
+        prior = DOMAIN_PRIORS[domain]
+
     news_articles = fetch_news(f"Iran {question[:60]}") if use_news else []
     news_summary = summarize_articles(news_articles)
     our_prob, reasoning = llm_score(question, news_summary, domain, prior, use_llm)

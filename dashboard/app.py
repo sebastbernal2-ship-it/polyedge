@@ -1,9 +1,12 @@
-from config import EDGE_THRESHOLD, BANKROLL
+from config import EDGE_THRESHOLD, BANKROLL, KELLY_FRACTION, MAX_BET_FRACTION
 from tracker.positions import get_calibration_summary, log_trade, _load, resolve_trade
 from model.estimator import auto_update_priors, DOMAIN_PRIORS, explain_updates
 from model.edge import get_trade_signals
 from data.news import get_latest_headlines
 from data.polymarket import get_iran_markets, get_price_history
+from data.whales import load_recent_whales
+from model.llm_analysis import analyze_whale
+from model.estimator import set_override_prior, get_effective_prior, MARKET_PRIORS
 from streamlit_autorefresh import st_autorefresh
 import datetime
 import pandas as pd
@@ -82,8 +85,10 @@ if signals:
     df["market_prob_%"] = (df["market_prob"] * 100).round(1)
     df["your_prob_%"]   = (df["your_prob"] * 100).round(1)
     df["volume_$"]      = df["volume"].apply(lambda x: f"${x:,.0f}")
+    df["orig_prior_%"] = df.get("original_prior", 0.5).apply(lambda x: f"{x*100:.0f}%" if x else "—")
+    df["eff_prior_%"] = df.get("effective_prior", 0.5).apply(lambda x: f"{x*100:.0f}%" if x else "—")
     st.dataframe(
-        df[["question","side","market_prob_%","your_prob_%",
+        df[["question","side","market_prob_%","your_prob_%", "orig_prior_%", "eff_prior_%",
             "edge_%","bet_size","volume_$","end_date","domain","reasoning"]],
         width="stretch"
     )
@@ -176,3 +181,111 @@ if open_trades:
         st.success("Trade resolved and Brier score recorded.")
 else:
     st.info("No open trades to resolve yet.")
+
+# ── Recent Whales Panel ───────────────────────────────────────
+st.header("Recent Whales")
+whales = load_recent_whales()
+if not whales:
+    st.info("No whale trades logged yet.")
+else:
+    labels = sorted({w.get('market_label') for w in whales if w.get('market_label')})
+    sel_label = st.selectbox("Filter by market", ["All"] + labels)
+    filtered = [w for w in whales if sel_label == "All" or w.get('market_label') == sel_label]
+    if not filtered:
+        st.info("No whales for selected market.")
+    else:
+        dfw = pd.DataFrame(filtered)
+        dfw["time"] = pd.to_datetime(dfw["timestamp"], errors='coerce')
+        dfw["wallet_short"] = dfw["wallet"].apply(lambda x: (x[:10] + "...") if isinstance(x, str) and len(x) > 13 else x)
+        display_df = dfw[["time", "market_label", "side", "size_usd", "price", "wallet_short"]]
+        st.dataframe(display_df, width="stretch")
+
+        # Select a whale to analyze
+        sel_index = st.selectbox(
+            "Select whale to analyze",
+            list(range(len(filtered))),
+            format_func=lambda i: f"{i}: {filtered[i]['market_label']} {filtered[i]['side']} ${filtered[i]['size_usd']:,.0f} @ {filtered[i]['price']:.2%}"
+        )
+        selected_whale = filtered[sel_index]
+
+        analyze_col, apply_col = st.columns(2)
+        with analyze_col:
+            if st.button("Run LLM analysis on selected whale"):
+                market_info = next((m for m in markets if m.get('id') == selected_whale.get('market_id')), None)
+                if not market_info:
+                    market_info = {"question": selected_whale.get('market_label')}
+                with st.spinner("Running LLM analysis..."):
+                    result = analyze_whale(market_info, selected_whale)
+                st.session_state['llm_result'] = result
+                st.subheader("LLM Analysis Result")
+                st.write(f"**Probability (p_yes):** {result.get('p_yes'):.2%}")
+                st.write(f"**Edge comment:** {result.get('edge_comment')}")
+                st.write(f"**Risks:** {result.get('risks')}")
+                if result.get('entry'):
+                    st.write(f"**Entry:** {result.get('entry'):.2%}")
+                if result.get('exit'):
+                    st.write(f"**Exit:** {result.get('exit'):.2%}")
+
+        if 'llm_result' in st.session_state:
+            with apply_col:
+                if st.button("Apply as new prior"):
+                    p = st.session_state['llm_result'].get('p_yes')
+                    if p is not None:
+                        ok = set_override_prior(selected_whale.get('market_id'), float(p))
+                        if ok:
+                            st.success(f"✓ Set override prior for {selected_whale.get('market_label')} → {p:.0%}")
+                            st.rerun()
+                        else:
+                            st.error("Could not persist override prior.")
+
+# ── Whale Integration Guide ───────────────────────────────────
+st.header("🐋 How to Use Whale Alerts")
+st.markdown("""
+### Whale Monitor + PolyEdge Workflow
+
+This dashboard shows your **edge signals** based on your probability estimates (priors).
+The whale monitor runs independently and highlights large trades for your review.
+
+#### Three-Step Integration:
+
+1. **Run whale monitor in background:**
+   ```bash
+   python whale_monitor.py  # (in another terminal)
+   ```
+   Watch for `🐋 WHALE:` alerts and copy the LLM prompt.
+
+2. **Analyze with LLM:**
+   - Paste the whale prompt into **ChatGPT**, **Claude**, or **Perplexity**.
+   - The LLM will assess whale trade edge for a 1-3 day swing.
+   - Request a probability estimate for the outcome.
+
+3. **Update your prior and refresh:**
+   - If you trust the LLM's analysis, note the new probability estimate.
+   - Update the relevant market in `MARKET_PRIORS` in `model/estimator.py`:
+     ```python
+     MARKET_PRIORS["0xABC123..."] = 0.62  # or use domain-based priors above
+     ```
+   - Refresh this dashboard (press R or wait for auto-refresh).
+   - New edge signals will reflect your updated probability estimates.
+
+#### Trading Rules:
+
+- **PolyEdge is the gatekeeper:** Only trade signals with edge ≥ {:.0%}
+- **Whale confirmation:** If a whale aligns with your signal, you may size slightly larger (still ≤ {:.0%} of bankroll per bet)
+- **Whale opposition:** If whale trades opposite your signal, re-check; reconsider or fade based on whale credibility
+- **Contest focus:** 14-day Polymarket contest ranks on **percentage return** — concentrate on fewer, higher-edge trades
+
+#### Key Configuration:
+
+- **BANKROLL:** ${:.0f} (set to your actual contest bankroll in `config.py`)
+- **EDGE_THRESHOLD:** {:.0%} (minimum edge to consider trading, in `config.py`)
+- **KELLY_FRACTION:** {:.2f} × Kelly with {:.0%} max bet cap per position
+- **Manual overrides:** Adjust "Your Priors" sliders above to test sensitivity
+
+#### Pro Tips:
+
+- Check whale alerts before trading a signal (they often arrive seconds before big moves).
+- Use whale trades as a **signal confidence booster**, not a replacement for your model.
+- Log trades in the "Log a Trade" section to track calibration and Brier scores.
+- Resolve trades promptly when markets settle to see how well your priors are calibrated.
+""".format(EDGE_THRESHOLD, MAX_BET_FRACTION, BANKROLL, EDGE_THRESHOLD, KELLY_FRACTION, MAX_BET_FRACTION))

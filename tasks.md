@@ -1,95 +1,120 @@
-# PolyEdge — Build Tasks
+# PolyEdge Build Tasks
 
-This file is the source of truth for what has been built, what is in progress,
-and what is next. Update status as each task is completed.
-
----
-
-## Status Legend
+Status legend:
 - [ ] Not started
-- [~] In progress
+- [/] In progress
 - [x] Complete
 
 ---
 
-## Phase 1 — Project Setup
-- [x] Create project folder structure (`data/`, `model/`, `tracker/`, `dashboard/`)
-- [x] Create and populate `requirements.txt`
-- [x] Create `.env` file with `NEWS_API_KEY` and `POLYMARKET_PRIVATE_KEY`
-- [x] Create `config.py` with constants (domains, thresholds, bankroll, Kelly fraction)
-- [ ] Set up and activate Python virtual environment
-- [ ] Run `pip install -r requirements.txt` successfully
+## Phase 1 – Environment & Core Setup (DONE)
+
+- [x] Project structure (`data/`, `model/`, `tracker/`, `dashboard/`, scripts)
+- [x] `requirements.txt` and dependency install
+- [x] Secrets configured (NewsAPI / Polymarket)
+- [x] `python main.py` produces core edge signals
+- [x] `streamlit run dashboard/app.py` runs without errors
 
 ---
 
-## Phase 2 — Data Layer
-- [ ] `data/polymarket.py` — `get_iran_markets()` pulls active Iran markets from Gamma API
-- [ ] `data/polymarket.py` — `get_price_history()` pulls CLOB price history per token
-- [ ] `data/news.py` — `get_latest_headlines()` pulls headlines per domain keyword via NewsAPI
-- [ ] Verify Gamma API returns live markets with correct yes/no prices
-- [ ] Verify NewsAPI returns fresh articles for Iran/ceasefire/Hormuz/regime keywords
+## Phase 2 – Model, Tracker & Whale Monitor (DONE)
+
+- [x] Bayesian estimator (`model/estimator.py`) with `MARKET_PRIORS`
+- [x] Edge & Kelly sizing (`model/edge.py`) using `EDGE_THRESHOLD`
+- [x] Position tracker (`tracker/positions.py`) with Brier scores
+- [x] Whale monitor (`whale_monitor.py`) polling CLOB and printing LLM prompts
+- [x] README and dashboard text updated for contest and whale usage
 
 ---
 
-## Phase 3 — Model Layer
-- [ ] `model/estimator.py` — `bayes_update()` single prior + likelihood ratio → posterior
-- [ ] `model/estimator.py` — `estimate_from_signals()` chains multiple updates together
-- [ ] `model/estimator.py` — `MARKET_PRIORS` dict populated with current Iran market priors
-- [ ] `model/edge.py` — `calc_edge()` computes your probability minus market price
-- [ ] `model/edge.py` — `kelly_size()` computes fractional Kelly bet size in dollars
-- [ ] `model/edge.py` — `get_trade_signals()` compares all markets against your priors, filters by threshold, returns ranked signals
+## Phase 3 – Contest Configuration (ALMOST DONE)
+
+- [/] Fill real market IDs in `whale_monitor.py::TARGET_MARKETS`
+- [/] Set actual `BANKROLL` and confirm `EDGE_THRESHOLD`, `KELLY_FRACTION`,
+    `MAX_BET_FRACTION` in `config.py` match contest risk appetite
+- [ ] Quick smoke test:
+    - [ ] `python main.py` (signals ok)
+    - [ ] `python whale_monitor.py` (sees at least one test whale or handles idle cleanly)
 
 ---
 
-## Phase 4 — Position Tracker
-- [ ] `tracker/positions.py` — `log_trade()` writes a new trade entry to `positions_log.json`
-- [ ] `tracker/positions.py` — `resolve_trade()` marks outcome and computes Brier score
-- [ ] `tracker/positions.py` — `get_calibration_summary()` returns avg Brier and trade count
-- [ ] Manually log the 3 current trade ideas (Hormuz YES, Ceasefire NO, Regime fall YES)
-- [ ] Confirm `positions_log.json` is writing and reading correctly
+## Phase 4 – In-App Whale Integration (NEW)
+
+Goal: make the whole workflow live inside the Streamlit app (no manual “paste prompt into chat”).
+
+### 4A. Whale Event Logging
+
+- [ ] Extend `whale_monitor.py` to:
+    - [ ] Append each whale trade to `data/whales_log.json`
+          (fields: timestamp, market_id, market_label, side, size_usd, price, wallet)
+    - [ ] Ensure JSON append is robust and deduplicates by `(wallet, timestamp, market_id, price)`
+- [ ] Add a loader helper in a new or existing module, e.g. `data/whales.py`:
+    - [ ] `load_recent_whales(limit: int = 50) -> list[dict]`
+
+### 4B. Dashboard “Recent Whales” Panel
+
+- [ ] Modify `dashboard/app.py` to:
+    - [ ] Import `load_recent_whales`
+    - [ ] Add a “Recent Whales” section:
+          - Table with time, market label, side, size, price, wallet (truncated)
+          - Optional filter by market label
+    - [ ] Auto-refresh this section when Streamlit reruns
 
 ---
 
-## Phase 5 — Dashboard
-- [ ] `dashboard/app.py` — Live edge signals table (question, side, market prob, your prob, edge %, bet size)
-- [ ] `dashboard/app.py` — Latest news feed panel (title, source, date, url)
-- [ ] `dashboard/app.py` — Calibration metrics panel (trade count, avg Brier score)
-- [ ] Run `streamlit run dashboard/app.py` without errors
-- [ ] Confirm all three panels populate with live data
+## Phase 5 – LLM Analysis Module (In-App)
+
+Goal: have the app call an LLM for whale analysis and return a structured probability.
+
+- [ ] Add config entries in `config.py`:
+    - [ ] `LLM_API_KEY` (read from env), `LLM_MODEL` / provider name, and a toggle `ENABLE_LLM_ANALYSIS`
+- [ ] Create `model/llm_analysis.py`:
+    - [ ] Function `analyze_whale(market_info, whale_trade, rules) -> dict` that:
+          - Builds the same logical prompt as `format_llm_prompt`
+          - Calls the chosen LLM API (mock or real depending on key)
+          - Parses response into a dict with:
+            - `p_yes: float`
+            - `edge_comment: str`
+            - `risks: str`
+            - `entry: Optional[float]`
+            - `exit: Optional[float]`
+    - [ ] Graceful fallback: if no `LLM_API_KEY`, return a dummy response and warn in logs
 
 ---
 
-## Phase 6 — Entry Point
-- [ ] `main.py` — loads `.env`, runs market fetch, runs edge scan, prints signals to terminal
-- [ ] `main.py` — prints latest news headlines
-- [ ] Run `python main.py` end to end without errors
+## Phase 6 – Runtime Priors & Trade Sizing in the App
+
+Goal: let the app update priors and recompute edges live when an LLM result is accepted.
+
+- [ ] In `model/estimator.py`:
+    - [ ] Add `OVERRIDE_PRIORS: Dict[str, float] = {}` (in-memory, plus optional JSON persistence)
+    - [ ] Add `get_effective_prior(market_id: str) -> float`:
+          - Returns `OVERRIDE_PRIORS.get(market_id, MARKET_PRIORS.get(market_id))`
+    - [ ] Add helper `set_override_prior(market_id: str, p: float)` that updates dict and optionally writes to `data/priors_overrides.json`
+- [ ] Update any code that uses `MARKET_PRIORS` directly in edge calculations to use `get_effective_prior` instead.
+
+- [ ] In `dashboard/app.py`:
+    - [ ] Allow selecting a market + whale row and clicking “Run LLM analysis”
+    - [ ] Display returned `p_yes`, comments, risks, entry/exit from `analyze_whale`
+    - [ ] Provide a button “Apply as new prior” that calls `set_override_prior` and triggers recomputation of edges/bet sizes
+    - [ ] Display both original prior and current effective prior in the main signals table
 
 ---
 
-## Phase 7 — Refinements (after MVP is running)
-- [ ] Add `data/polymarket.py` — price history chart per market in dashboard
-- [ ] Add `model/estimator.py` — auto-parse news headlines into likelihood ratios using keyword rules
-- [ ] Add `tracker/positions.py` — ROI tracker (total bankroll over time)
-- [ ] Add `dashboard/app.py` — manual prior override sliders per market
-- [ ] Add `dashboard/app.py` — auto-refresh every N minutes
-- [ ] Add alert system — print or notify when a new edge above threshold appears
-- [ ] Expand beyond Iran — add `DOMAINS` tags for crypto and macro markets
+## Phase 7 – Final Contest Playbook & Polish
 
----
+- [ ] Add `docs/CONTEST_PLAYBOOK.md` or expand `README.md` to describe:
+    - [ ] How to use:
+          - Core signals
+          - Recent whales
+          - LLM analysis
+          - Prior overrides
+    - [ ] Trade rule: only act when `edge ≥ EDGE_THRESHOLD` and liquidity is reasonable
+    - [ ] How percentage-return focus affects number of positions and bet size
 
-## Current Priors (update as news comes in)
+- [ ] Final end-to-end test:
+    - [ ] Start Streamlit dashboard
+    - [ ] Start whale monitor
+    - [ ] Simulate at least one whale event and run LLM analysis in-app
+    - [ ] Confirm priors update, edges change, and recommended bet size adjusts
 
-| Market | Your Estimate | Market Price | Edge | Side | Bet |
-|--------|--------------|-------------|------|------|-----|
-| US x Iran ceasefire by March 31 | 20% | 44% | +23pts NO | NO | $4 |
-| Iran closes Hormuz by March 31 | 75% | 60% | +15pts YES | YES | $4 |
-| Iranian regime fall by March 31 | 27% | 16% | +11pts YES | YES | $2 |
-
----
-
-## Notes
-- Polymarket Gamma API is fully public, no auth needed for market data
-- CLOB API needs wallet private key only for placing orders, not reading prices
-- NewsAPI free tier = 100 requests/day, enough for hourly scans
-- `MARKET_PRIORS` in `model/estimator.py` must be updated manually when significant news breaks
-- Brier score: 0 = perfect, 0.25 = random guessing, lower is better
