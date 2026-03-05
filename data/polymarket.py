@@ -1,3 +1,5 @@
+from typing import List, Dict, Any
+from datetime import datetime, timezone
 import requests
 import json
 
@@ -77,3 +79,64 @@ def get_price_history(token_id: str, interval="1h"):
         return resp.json().get("history", [])
     except Exception:
         return []
+
+
+# ---- Auto-discovery helpers (loose) ----
+
+import requests
+
+GAMMA_API = "https://gamma-api.polymarket.com"
+
+def fetch_candidate_markets(deadline=None) -> list[dict]:
+    """
+    Fetch a broad set of active markets from Polymarket.
+    Very loose filtering: just require id + question; yes_price optional.
+    """
+    params = {
+        "limit": 2000,
+        "active": True,
+        "closed": False,
+        "order": "volume",
+    }
+    r = requests.get(f"{GAMMA_API}/markets", params=params, timeout=10)
+    r.raise_for_status()
+    markets = r.json()
+    if not isinstance(markets, list):
+        return []
+
+    out = []
+    for m in markets:
+        if not isinstance(m, dict):
+            continue
+
+        m_id = m.get("conditionId") or m.get("id")
+        label = m.get("question") or m.get("title") or m.get("name")
+
+        # outcomePrices is usually a JSON string like '["0.23","0.77"]'
+        raw_prices = m.get("outcomePrices")
+        yes_price = None
+        if raw_prices is not None:
+            try:
+                if isinstance(raw_prices, str):
+                    prices = json.loads(raw_prices)
+                else:
+                    prices = raw_prices
+                if isinstance(prices, (list, tuple)) and prices:
+                    yes_price = float(prices[0])
+            except Exception:
+                yes_price = None
+
+        if not m_id or not label:
+            continue
+
+        out.append(
+            {
+                "id": str(m_id),
+                "question": str(label),
+                "yes_price": yes_price,
+                "resolve_time": None,
+            }
+        )
+
+    return out
+

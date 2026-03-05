@@ -1,107 +1,184 @@
-"""
-PolyEdge: Edge Calculation and Sizing Engine
-
-Core logic:
-  1. calc_edge() → your_prob - market_prob
-  2. kelly_size() → fractional Kelly bet with bankroll cap
-  3. get_trade_signals() → filter by edge threshold, return sorted signals
-
-CONTEST STRATEGY:
-  EDGE_THRESHOLD is the single gatekeeper. Set in config.py.
-  Only trade when |edge| >= EDGE_THRESHOLD (e.g., 0.15 for 15 ppts).
-  This focuses capital on high-conviction, high-edge opportunities.
-
-WHALE INTEGRATION:
-  If a whale trade aligns with your model, you can increase size (still capped by MAX_BET_FRACTION).
-  If a whale trade opposes your model, reconsider or fade depending on whale credibility.
-"""
-
-from config import KELLY_FRACTION, MAX_BET_FRACTION, BANKROLL, EDGE_THRESHOLD
-from model.estimator import estimate_edge, get_effective_prior, MARKET_PRIORS
+from typing import List, Dict, Any
+from config import EDGE_THRESHOLD, KELLY_FRACTION, MAX_BET_FRACTION, BANKROLL
+from .estimator import estimate_edge_generic
 
 
-def calc_edge(your_prob: float, market_prob: float) -> float:
+def safe_kelly(your_prob: float, market_price: float, bankroll: float) -> float:
     """
-    Raw edge = your probability estimate - market probability (YES price).
-    
-    Interpretation:
-      - edge > 0: market is underestimating YES probability (buy YES)
-      - edge < 0: market is overestimating YES probability (buy NO)
-      - |edge| > EDGE_THRESHOLD: consider trading
+    Kelly bet fraction for a YES position, capped and safe-guarded.
+    your_prob, market_price are in [0,1].
     """
-    return round(your_prob - market_prob, 4)
-
-
-def kelly_size(your_prob: float, market_price: float, bankroll: float) -> float:
-    """
-    Fractional Kelly bet sizing.
-    b = net odds on a $1 bet (how much you win per $1 risked)
-    f = (b*p - q) / b
-    """
-    b = (1 - market_price) / market_price  # payout ratio
-    p = your_prob
-    q = 1 - p
-    f_full = (b * p - q) / b
-    f_kelly = f_full * KELLY_FRACTION
-    # cap at MAX_BET_FRACTION of bankroll
-    return round(min(f_kelly, MAX_BET_FRACTION) * bankroll, 2)
+    edge = your_prob - market_price
+    if edge <= 0 or market_price <= 0 or market_price >= 1:
+        return 0.0
+    b = (1.0 - market_price) / market_price  # payout ratio
+    raw = edge / b
+    frac = raw * KELLY_FRACTION
+    frac = max(0.0, min(frac, MAX_BET_FRACTION))
+    return frac
 
 
 def get_trade_signals(
-    markets: list[dict],
-    estimates: dict,
-    threshold: float,
-    use_llm: bool = True,
-    use_news: bool = True,
-) -> list[dict]:
+    markets: List[Dict[str, Any]],
+    override_priors,
+    edge_threshold: float = EDGE_THRESHOLD,
+    use_llm: bool = False,
+    use_news: bool = False,
+) -> List[Dict[str, Any]]:
     """
-    Compare your probability estimates against live market prices.
-    Returns markets where |edge| exceeds threshold, sorted by |edge| desc.
-    For markets not in `estimates`, calls estimate_edge() with LLM/news flags.
+    Build trade signals for a list of markets using the generic estimator.
+
+    Each signal dict contains at least:
+    - question
+    - side ("Buy Yes"/"Buy No")
+    - market_prob (float)
+    - your_prob (float)
+    - edge (float)
+    - kelly_pct (float, percent of bankroll)
+    - bet_size (float, dollars)
     """
-    signals = []
+    signals: List[Dict[str, Any]] = []
+
     for m in markets:
-        mid = m["yes_price"]
-        manual_p = estimates.get(m["id"])
+        try:
+            question = m.get("question") or m.get("title") or m.get("name")
+            if not question:
+                continue
 
-        # Compute effective prior (slider overrides take precedence via `estimates` arg)
-        effective_prior = estimates.get(m["id"]) if estimates and m.get("id") else get_effective_prior(m.get("id"))
+            # Market implied YES probability
+            market_prob = m.get("yes_price") or m.get("probability")
+            if market_prob is None:
+                continue
+            try:
+                market_prob = float(market_prob)
+            except Exception:
+                continue
+            if not (0.0 < market_prob < 1.0):
+                continue
 
-        if manual_p is not None:
-            your_p = manual_p
-            reasoning = "Manual prior override"
-            domain = "manual"
-        else:
-            result = estimate_edge(
-                question=m["question"],
-                market_prob=mid,
-                end_date=m.get("end_date"),
+            # Ask generic estimator for our view
+            est = estimate_edge_generic(
+                market_info=m,
+                market_prob=market_prob,
+                override_priors=override_priors,
                 use_llm=use_llm,
                 use_news=use_news,
-                market_id=m.get("id"),
             )
-            your_p = result["our_prob"]
-            reasoning = result["reasoning"]
-            domain = result["domain"]
+            our_prob = est.get("our_prob")
+            edge = est.get("edge")
 
-        edge = calc_edge(your_p, mid)
-        if abs(edge) >= threshold:
-            side = "YES" if edge > 0 else "NO"
-            mkt_price = mid if side == "YES" else m["no_price"]
-            original_prior = MARKET_PRIORS.get(m.get("id"))
-            signals.append({
-                "question":    m["question"],
-                "market_prob": mid,
-                "your_prob":   your_p,
-                "original_prior": original_prior,
-                "effective_prior": effective_prior,
-                "edge":        edge,
-                "side":        side,
-                "bet_size":    kelly_size(your_p, mkt_price, BANKROLL),
-                "volume":      m["volume"],
-                "end_date":    m["end_date"],
-                "domain":      domain,
-                "reasoning":   reasoning,
-            })
+            if our_prob is None or edge is None:
+                continue
+            try:
+                our_prob = float(our_prob)
+                edge = float(edge)
+            except Exception:
+                continue
 
-    return sorted(signals, key=lambda x: abs(x["edge"]), reverse=True)
+            # Require a minimum edge
+            if abs(edge) < edge_threshold:
+                continue
+
+            # Direction and Kelly
+            side = "Buy Yes" if edge > 0 else "Buy No"
+            effective_prob = our_prob if edge > 0 else (1.0 - our_prob)
+            effective_price = market_prob if edge > 0 else (1.0 - market_prob)
+            kelly_frac = safe_kelly(effective_prob, effective_price, BANKROLL)
+            bet_size = BANKROLL * kelly_frac
+            kelly_pct = kelly_frac * 100.0
+
+            signals.append(
+                {
+                    "question": question,
+                    "side": side,
+                    "market_prob": market_prob,
+                    "your_prob": our_prob,
+                    "edge": edge,
+                    "kelly_pct": kelly_pct,
+                    "bet_size": bet_size,
+                    "raw": est,
+                }
+            )
+        except Exception:
+            # Skip any market that blows up
+            continue
+
+    return signals
+
+
+def get_smart_money_signals(
+    markets: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+
+
+    import json
+    import os
+    from model.market_flow import analyze_market_flow
+    from config import BANKROLL
+
+    WHALE_LOG_PATH = os.path.join("data", "whales_log.json")
+
+    def _load_whales_from_file(path: str = WHALE_LOG_PATH):
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except Exception:
+            return []
+
+
+    try:
+        whale_trades_all = _load_whales_from_file()
+    except Exception:
+        whale_trades_all = []
+
+    signals: List[Dict[str, Any]] = []
+
+    for m in markets:
+        question = m.get("question") or m.get("title") or m.get("name")
+        if not question:
+            continue
+
+        market_prob = m.get("yes_price") or m.get("probability")
+        try:
+            market_prob = float(market_prob)
+        except Exception:
+            continue
+        if not (0.0 < market_prob < 1.0):
+            continue
+
+        mid = m.get("id") or m.get("conditionId") or m.get("market_id")
+        trades = [
+            t
+            for t in whale_trades_all
+            if (t.get("market_id") == mid) or (t.get("market_label") == question)
+        ]
+        if not trades:
+            continue
+
+        try:
+            res = analyze_market_flow(m, trades, bankroll=BANKROLL)
+        except Exception:
+            continue
+
+        side = res.get("recommendation") or "Skip"
+        edge = float(res.get("edge") or 0.0)
+        kelly_pct = float(res.get("kelly_pct") or 0.0)
+        sm_pct = res.get("sm_pct")
+        if sm_pct is not None:
+            sm_pct = float(sm_pct)
+
+        signals.append(
+            {
+                "question": question,
+                "side": side,
+                "market_prob": market_prob,
+                "your_prob": res.get("prior_prob"),  # or blended prob if you have it
+                "edge": edge,
+                "kelly_pct": kelly_pct,
+                "bet_size": BANKROLL * (kelly_pct / 100.0),
+                "sm_pct": sm_pct,
+                "raw": res,
+            }
+        )
+
+    return signals

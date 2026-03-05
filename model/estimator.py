@@ -314,3 +314,168 @@ def explain_updates(articles: list, market_priors: dict) -> dict:
             "steps": steps,
         }
     return audit
+
+def classify_generic_category(m: dict) -> str:
+    """Broad category classification for generic priors."""
+    # Try tags/category/slug for hints
+    tags = " ".join(m.get("tags", [])).lower()
+    question = (m.get("question") or m.get("title") or m.get("name") or "").lower()
+    slug = (m.get("slug") or m.get("eventSlug") or "").lower()
+    text = " ".join([tags, question, slug])
+
+    if any(w in text for w in ["president", "election", "primary", "senate", "house", "governor", "party"]):
+        return "politics"
+    if any(w in text for w in ["fed", "interest rate", "cpi", "inflation", "gdp", "unemployment"]):
+        return "macro"
+    if any(w in text for w in ["bitcoin", "ethereum", "solana", "xrp", "crypto", "btc", "eth"]):
+        return "crypto"
+    if any(w in text for w in ["vs.", "vs ", "mlb", "nba", "nfl", "nhl", "premier league", "liga", "match", "spread", "total", "over/under", "o/u"]):
+        return "sports"
+    if any(w in text for w in ["stock", "close above", "price of", "meta", "amazon", "palantir"]):
+        return "stocks"
+    return "other"
+
+
+GENERIC_CATEGORY_PRIORS = {
+    "politics": 0.50,
+    "macro":    0.50,
+    "crypto":   0.50,
+    "sports":   0.50,
+    "stocks":   0.50,
+    "other":    0.50,
+}
+
+
+def estimate_edge_generic(
+    market_info: dict,
+    market_prob: float,
+    override_priors: dict = None,
+    use_llm: bool = True,
+    use_news: bool = False,
+) -> dict:
+    """
+    Generic, domain-agnostic edge estimator for any Polymarket market.
+
+    Inputs:
+      - market_info: full market dict from fetch_candidate_markets()
+      - market_prob: implied YES probability (0-1)
+      - override_priors: optional dict market_id -> prior probability
+      - use_llm/use_news: kept for API compatibility; defaults conservative
+
+    Returns:
+      dict with keys: question, our_prob, edge, prior, market_prob, signal, direction, reasoning, ...
+    """
+    question = market_info.get("question") or market_info.get("title") or market_info.get("name") or ""
+    market_id = market_info.get("id")
+    end_date = market_info.get("end_date")
+
+    # 1) Prior: per-market override, else generic category prior
+    # Try runtime overrides (from OVERRIDE_PRIORS/set_override_prior)
+    prior = None
+    if market_id:
+        p_eff = get_effective_prior(market_id)
+        if p_eff is not None:
+            prior = p_eff
+
+    if prior is None:
+        cat = classify_generic_category(market_info)
+        prior = GENERIC_CATEGORY_PRIORS.get(cat, 0.50)
+    else:
+        cat = classify_generic_category(market_info)
+
+    # 2) Optional news / LLM tilt (disabled by default for generic)
+    # You can turn these on later by passing use_news/use_llm=True from caller.
+    news_summary = ""
+    reasoning = ""
+    our_prob = prior
+
+    if use_news:
+        try:
+            articles = fetch_news(question[:80])
+            news_summary = summarize_articles(articles)
+        except Exception:
+            news_summary = ""
+    else:
+        news_summary = "News integration disabled for generic estimator."
+
+    if use_llm and NAVIGATOR_KEY:
+        try:
+            # Re-use llm_score but feed generic category as 'domain'
+            our_prob, reasoning = llm_score(question, news_summary, cat, prior, use_llm=True)
+        except Exception as e:
+            print(f"[generic llm_score error] {e}")
+            our_prob = prior
+            reasoning = "LLM failed, using prior only."
+    else:
+        # Simple deterministic tilt based on market price:
+        # if market is far from 50%, assume some wisdom-of-crowds and nudge toward market_prob.
+        # This keeps our_prob reasonable even without LLM/news.
+        delta = market_prob - prior
+        # shrink factor to avoid overfitting to price
+        shrink = 0.5
+        our_prob = max(0.01, min(0.99, prior + shrink * delta))
+        reasoning = (
+            f"Generic estimator: base prior={prior:.2f}, "
+            f"nudged {shrink:.2f} toward market_prob={market_prob:.2f}."
+        )
+
+    # 3) Edge and signal strength
+    edge = our_prob - market_prob
+    abs_edge = abs(edge)
+    if abs_edge >= 0.15:
+        signal = "STRONG"
+    elif abs_edge >= 0.08:
+        signal = "MODERATE"
+    elif abs_edge >= 0.04:
+        signal = "WEAK"
+    else:
+        signal = "NONE"
+
+    direction = "BUY YES" if edge > 0 else "BUY NO"
+
+    # 4) Days to expiry (if available)
+    days_left = None
+    if end_date:
+        try:
+            ed = datetime.date.fromisoformat(str(end_date)[:10])
+            days_left = (ed - datetime.date.today()).days
+        except Exception:
+            pass
+
+    return {
+        "question": question,
+        "domain": cat,
+        "prior": prior,
+        "market_prob": market_prob,
+        "our_prob": our_prob,
+        "edge": edge,
+        "signal": signal,
+        "direction": direction if signal != "NONE" else "HOLD",
+        "reasoning": reasoning,
+        "news_summary": news_summary,
+        "end_date": end_date,
+        "days_left": days_left,
+        "use_llm": use_llm,
+        "use_news": use_news,
+        "timestamp": datetime.datetime.utcnow().isoformat(),
+    }
+
+
+def estimate_edge_smart_money(
+    market_info: dict,
+    market_prob: float,
+    bankroll: float,
+) -> dict:
+    """Placeholder smart-money estimator.
+
+    For now this just returns a minimal dict so callers can be wired up
+    without breaking anything. Later we will have it call
+    model.market_flow.get_smart_money_view once whale trades are available.
+    """
+    question = market_info.get("question") or market_info.get("title") or market_info.get("name") or ""
+    return {
+        "question": question,
+        "our_prob": None,
+        "edge": None,
+        "source": "smart_money",
+    }

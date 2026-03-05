@@ -1,291 +1,323 @@
-from config import EDGE_THRESHOLD, BANKROLL, KELLY_FRACTION, MAX_BET_FRACTION
-from tracker.positions import get_calibration_summary, log_trade, _load, resolve_trade
-from model.estimator import auto_update_priors, DOMAIN_PRIORS, explain_updates
-from model.edge import get_trade_signals
-from data.news import get_latest_headlines
-from data.polymarket import get_iran_markets, get_price_history
-from data.whales import load_recent_whales
-from model.llm_analysis import analyze_whale
-from model.estimator import set_override_prior, get_effective_prior, MARKET_PRIORS
-from streamlit_autorefresh import st_autorefresh
-import datetime
-import pandas as pd
-import streamlit as st
-from dotenv import load_dotenv
-import sys
 import os
-sys.path.insert(
-    0,
-    os.path.abspath(
-        os.path.join(
-            os.path.dirname(__file__),
-             '..')))
+from typing import List, Dict, Any
 
-load_dotenv()
+import streamlit as st
+import pandas as pd
+import datetime
+import json
+
+from config import EDGE_THRESHOLD, BANKROLL
+from data.polymarket import fetch_candidate_markets
+from model.edge import get_smart_money_signals
 
 
-st.set_page_config(page_title="PolyEdge", layout="wide")
-st.title("PolyEdge — Iran Signal Dashboard")
-
-# ── Auto-refresh ──────────────────────────────────────────────
-refresh_interval = st.sidebar.selectbox(
-    "Auto-refresh interval (minutes)", [0, 1, 5, 10, 30], index=3
+st.set_page_config(
+    page_title="PolyEdge",
+    page_icon="📈",
+    layout="wide",
 )
-if refresh_interval > 0:
-    st_autorefresh(interval=refresh_interval * 60 * 1000, key="autorefresh")
 
-# ── Fetch news first so auto-priors can use it ────────────────
-with st.spinner("Fetching news..."):
-    articles = get_latest_headlines()
 
-# ── Auto-update priors from news ──────────────────────────────
-auto_priors = auto_update_priors(articles, DOMAIN_PRIORS)
-
-# — Signal controls ————————————————————
-st.sidebar.header("Signal Controls")
-use_llm = st.sidebar.checkbox("Use LLM Scoring (Navigator/Llama)", value=True)
-use_news = st.sidebar.checkbox("Use News Signals (NewsAPI)", value=True)
-pre_deadline_only = st.sidebar.checkbox(
-    "Only pre-March 16, 2026 markets", value=True)
-st.sidebar.markdown("---")
-
-# ── Manual prior overrides on top of auto values ─────────────
-st.sidebar.header("Adjust Your Priors")
-prior_labels = {
-    "0x3c3c46ea0d48ea0e3049ee04bdfe1e4e9071721ec9146d492cd16c657df9ab92": "Iran/Hezbollah strike Cyprus by Mar 7",
-    "0x7c3f9482e5c8d1c00ad849581324b5e224f5e960476f535453e04c1f55d4ea49": "Gulf State strikes Iran by Mar 7",
-    "0x65c08331b9d3fe9c2142f15389960fff5f5e70f8230026170337ed257cbde9b5": "US seizes Iran tanker by Mar 7",
-    "0x74686395e62a73a6b59cf1a6f2132af745224b5c8cf0d5ee053e4c59c7930d81": "US seizes another tanker by Mar 7",
-    "0xed8049df11e16381d806ccb24226585bf2d314fcebe7c9cd723d6a073622fb30": "War powers resolution by Mar 13",
-}
-
-override_priors = {}
-for market_id, label in prior_labels.items():
-    auto_val = auto_priors.get(market_id, 0.5)
-    override_priors[market_id] = st.sidebar.slider(
-        f"{label} (auto: {auto_val:.0%})",
-        0.0, 1.0, float(auto_val), 0.01
-    )
-
-# ── Live markets ──────────────────────────────────────────────
-st.header("Live Edge Signals")
-with st.spinner("Fetching markets..."):
-    markets = get_iran_markets()
-    if pre_deadline_only:
-        deadline = datetime.date(2026, 3, 16)
-        markets = [m for m in markets if m.get("end_date") and
-                   str(m["end_date"])[:10] <= str(deadline)]
-        st.caption(f"{len(markets)} markets resolve before March 16")
-
-    signals = get_trade_signals(markets, override_priors, EDGE_THRESHOLD, use_llm=use_llm, use_news=use_news)
-
-if signals:
-    df = pd.DataFrame(signals)
-    df["edge_%"]        = (df["edge"] * 100).round(1)
-    df["market_prob_%"] = (df["market_prob"] * 100).round(1)
-    df["your_prob_%"]   = (df["your_prob"] * 100).round(1)
-    df["volume_$"]      = df["volume"].apply(lambda x: f"${x:,.0f}")
-    df["orig_prior_%"] = df.get("original_prior", 0.5).apply(lambda x: f"{x*100:.0f}%" if x else "—")
-    df["eff_prior_%"] = df.get("effective_prior", 0.5).apply(lambda x: f"{x*100:.0f}%" if x else "—")
-    st.dataframe(
-        df[["question","side","market_prob_%","your_prob_%", "orig_prior_%", "eff_prior_%",
-            "edge_%","bet_size","volume_$","end_date","domain","reasoning"]],
-        width="stretch"
-    )
-
-    # ── Log trade button ──────────────────────────────────────
-    st.subheader("Log a Trade")
-    selected = st.selectbox("Select signal to log", [s["question"] for s in signals])
-    if st.button("Log this trade"):
-        match = next(s for s in signals if s["question"] == selected)
-        mkt   = next(m for m in markets if m["question"] == selected)
-        log_trade(
-            market_id=mkt["id"],
-            question=match["question"],
-            side=match["side"],
-            price=match["market_prob"],
-            size=match["bet_size"],
-            your_prob=match["your_prob"]
-        )
-        st.success(f"Logged: {match['side']} {match['question']} @ {match['market_prob']:.0%}")
-else:
-    st.info("No edges above threshold right now.")
-
-# ── Price history chart ───────────────────────────────────────
-st.header("Price History")
-if signals:
-    chart_market = st.selectbox("Select market to chart", [s["question"] for s in signals])
-    match_mkt    = next(m for m in markets if m["question"] == chart_market)
-    token_ids    = match_mkt.get("token_ids", [])
-    if token_ids:
-        with st.spinner("Loading price history..."):
-            history = get_price_history(token_ids[0])
-        if history:
-            hist_df = pd.DataFrame(history)
-            hist_df["t"] = pd.to_datetime(hist_df["t"], unit="s")
-            hist_df = hist_df.rename(columns={"t": "time", "p": "YES price"})
-            st.line_chart(hist_df.set_index("time")["YES price"])
-        else:
-            st.info("No price history available for this market.")
+def format_signal_label(sig: Dict[str, Any]) -> str:
+    """
+    Label for the selectbox:
+    Question | side | SM% | edge% | Kelly% | bet$
+    """
+    edge_pct = sig.get("edge", 0.0) * 100.0
+    kelly_pct = sig.get("kelly_pct", 0.0)
+    bet = sig.get("bet_size", 0.0)
+    side = sig.get("side", "Buy Yes")
+    q = sig.get("question", "")[:120]
+    sm_pct = sig.get("sm_pct")
+    if sm_pct is None:
+        sm_str = "SM n/a"
     else:
-        st.info("No token ID for this market.")
+        sm_str = f"SM {sm_pct:.1f}%"
+    return f"{q} | {side} | {sm_str} | edge {edge_pct:+.1f}% | Kelly {kelly_pct:.1f}% | ${bet:.2f}"
 
-# ── Probability audit trail ───────────────────────────────────
-st.header("How Were These Probabilities Calculated?")
-audit = explain_updates(articles, DOMAIN_PRIORS)
-for market_id, result in audit.items():
-    with st.expander(f"{result['label']} — final estimate: {result['final_prob']:.0%}"):
-        steps_df = pd.DataFrame(result["steps"])
-        st.dataframe(steps_df, width="stretch")
 
-# ── News feed ─────────────────────────────────────────────────
-st.header("Latest News Signals")
-NOISE_KEYWORDS = ["cricket", "lunar", "eclipse", "bollywood", "recipe",
-                  "grahan", "paint stock", "gold silver", "zipline"]
-filtered = [
-    a for a in articles
-    if not any(nk in a["title"].lower() for nk in NOISE_KEYWORDS)
-]
-for a in filtered[:20]:
-    st.markdown(
-        f"**[{a['title']}]({a['url']})** — *{a['source']}* ({a['published'][:10]})"
+def is_politics_market(m: Dict[str, Any]) -> bool:
+    """
+    Simple politics filter: checks category/tags or question text.
+    """
+    cat = (m.get("category") or "").lower()
+    tags = " ".join(m.get("tags") or []).lower()
+    q = (m.get("question") or m.get("title") or m.get("name") or "").lower()
+
+    politics_keywords = [
+        "election",
+        "president",
+        "senate",
+        "house seat",
+        "governor",
+        "parliament",
+        "congress",
+        "democrat",
+        "republican",
+        "labour",
+        "tory",
+        "prime minister",
+        "mp ",
+        "mp?",
+        "mp,",
+        "mp.",
+    ]
+
+    text = " ".join([cat, tags, q])
+    return any(k in text for k in politics_keywords)
+
+
+def main() -> None:
+    st.title("PolyEdge – Smart Money Signal Dashboard")
+
+    # Sidebar controls
+    st.sidebar.header("Controls")
+
+    use_llm = st.sidebar.checkbox("Use LLM features", value=False)
+    use_news = st.sidebar.checkbox("Use news features", value=False)
+
+    # Smart Money slider (0–100%)
+    min_sm_pct = st.sidebar.slider(
+        "Minimum Smart Money % (SM%)",
+        min_value=0.0,
+        max_value=100.0,
+        value=0.0,
+        step=5.0,
+        help="Only show markets where Smart Money is at least this % on the recommended side.",
     )
 
-# ── Calibration ───────────────────────────────────────────────
-st.header("Your Calibration")
-cal  = get_calibration_summary()
-col1, col2 = st.columns(2)
-col1.metric("Resolved Trades", cal["trades"])
-if cal["trades"] > 0:
-    col2.metric(
-        "Avg Brier Score", cal["avg_brier"],
-        help="Lower = better. Perfect = 0, Random = 0.25"
+    # Edge threshold slider (in percent)
+    edge_threshold_pct = st.sidebar.slider(
+        "Minimum edge (%)",
+        min_value=0.0,
+        max_value=30.0,
+        value=0.0,
+        step=1.0,
+        help="Only show trades where |our_prob - market_prob| is at least this many percentage points.",
+    )
+    edge_threshold = edge_threshold_pct / 100.0
+
+    # Minimum Kelly slider (in percent of bankroll)
+    min_kelly_pct = st.sidebar.slider(
+        "Minimum Kelly (%)",
+        min_value=0.0,
+        max_value=20.0,
+        value=0.0,
+        step=0.5,
+        help="Only show trades where Kelly recommends at least this % of bankroll.",
     )
 
-# ── Resolve a trade ───────────────────────────────────────────
-st.subheader("Resolve a Trade")
-open_trades = [e for e in _load() if e["outcome"] is None]
-if open_trades:
-    resolve_q = st.selectbox(
-        "Select trade to resolve",
-        [f"{e['question']} ({e['side']})" for e in open_trades]
+    politics_only = st.sidebar.checkbox(
+        "Politics only",
+        value=False,
+        help="If checked, only show markets that look like politics.",
     )
-    outcome = st.radio("Outcome", ["YES won", "NO won"])
-    if st.button("Submit resolution"):
-        match = next(
-            e for e in open_trades
-            if f"{e['question']} ({e['side']})" == resolve_q
-        )
-        resolved = outcome == "YES won"
-        resolve_trade(match["market_id"], resolved)
-        st.success("Trade resolved and Brier score recorded.")
-else:
-    st.info("No open trades to resolve yet.")
 
-# ── Recent Whales Panel ───────────────────────────────────────
-st.header("Recent Whales")
-whales = load_recent_whales()
-if not whales:
-    st.info("No whale trades logged yet.")
-else:
-    labels = sorted({w.get('market_label') for w in whales if w.get('market_label')})
-    sel_label = st.selectbox("Filter by market", ["All"] + labels)
-    filtered = [w for w in whales if sel_label == "All" or w.get('market_label') == sel_label]
+    st.sidebar.markdown(f"**Bankroll**: ${BANKROLL:,.2f}")
+
+    st.write(
+        "This dashboard shows model-driven trading signals over Polymarket markets, "
+        "ranked by Smart Money concentration, Kelly sizing, and edge."
+    )
+
+    # Fetch markets
+    st.subheader("Candidate markets")
+    try:
+        markets: List[Dict[str, Any]] = fetch_candidate_markets()
+    except Exception as e:
+        st.error(f"Failed to fetch markets: {e}")
+        return
+
+    st.caption(f"Fetched {len(markets)} raw markets from Polymarket.")
+
+    # Optional politics filter before signal estimation
+    if politics_only:
+        markets = [m for m in markets if is_politics_market(m)]
+        st.caption(f"After politics filter: {len(markets)} markets.")
+
+    # Build signals
+    st.subheader("Smart Money trade signals")
+
+    override_priors: Dict[str, float] = {}
+
+    with st.spinner("Computing smart-money signals..."):
+        try:
+            signals = get_smart_money_signals(markets=markets)
+        except Exception as e:
+            st.error(f"Error computing trade signals: {e}")
+            return
+
+    # Normalize sm_pct if present
+    for s in signals:
+        sm = s.get("sm_pct")
+        if sm is not None:
+            try:
+                s["sm_pct"] = float(sm)
+            except Exception:
+                s["sm_pct"] = None
+
+    # Apply user filters (SM%, edge, Kelly) on top of ranking
+    filtered = []
+    for s in signals:
+        edge = abs(s.get("edge", 0.0))
+        kelly = s.get("kelly_pct", 0.0) or 0.0
+        sm_pct = s.get("sm_pct")
+
+        if edge < edge_threshold:
+            continue
+        if kelly < min_kelly_pct:
+            continue
+        if min_sm_pct > 0.0:
+            # if we require SM%, skip entries with no smart-money info
+            if sm_pct is None or sm_pct < min_sm_pct:
+                continue
+
+        filtered.append(s)
+
     if not filtered:
-        st.info("No whales for selected market.")
-    else:
-        dfw = pd.DataFrame(filtered)
-        dfw["time"] = pd.to_datetime(dfw["timestamp"], errors='coerce')
-        dfw["wallet_short"] = dfw["wallet"].apply(lambda x: (x[:10] + "...") if isinstance(x, str) and len(x) > 13 else x)
-        display_df = dfw[["time", "market_label", "side", "size_usd", "price", "wallet_short"]]
-        st.dataframe(display_df, width="stretch")
-
-        # Select a whale to analyze
-        sel_index = st.selectbox(
-            "Select whale to analyze",
-            list(range(len(filtered))),
-            format_func=lambda i: f"{i}: {filtered[i]['market_label']} {filtered[i]['side']} ${filtered[i]['size_usd']:,.0f} @ {filtered[i]['price']:.2%}"
+        st.info(
+            "No signals found at these Smart Money / edge / Kelly settings. "
+            "Try lowering one or more sliders."
         )
-        selected_whale = filtered[sel_index]
+        return
 
-        analyze_col, apply_col = st.columns(2)
-        with analyze_col:
-            if st.button("Run LLM analysis on selected whale"):
-                market_info = next((m for m in markets if m.get('id') == selected_whale.get('market_id')), None)
-                if not market_info:
-                    market_info = {"question": selected_whale.get('market_label')}
-                with st.spinner("Running LLM analysis..."):
-                    result = analyze_whale(market_info, selected_whale)
-                st.session_state['llm_result'] = result
-                st.subheader("LLM Analysis Result")
-                st.write(f"**Probability (p_yes):** {result.get('p_yes'):.2%}")
-                st.write(f"**Edge comment:** {result.get('edge_comment')}")
-                st.write(f"**Risks:** {result.get('risks')}")
-                if result.get('entry'):
-                    st.write(f"**Entry:** {result.get('entry'):.2%}")
-                if result.get('exit'):
-                    st.write(f"**Exit:** {result.get('exit'):.2%}")
+    st.caption(
+        f"Found {len(filtered)} signals with SM% ≥ {min_sm_pct:.1f}%, "
+        f"|edge| ≥ {edge_threshold_pct:.1f}% and Kelly ≥ {min_kelly_pct:.1f}% "
+        f"(bankroll = ${BANKROLL:,.2f})."
+    )
 
-        if 'llm_result' in st.session_state:
-            with apply_col:
-                if st.button("Apply as new prior"):
-                    p = st.session_state['llm_result'].get('p_yes')
-                    if p is not None:
-                        ok = set_override_prior(selected_whale.get('market_id'), float(p))
-                        if ok:
-                            st.success(f"✓ Set override prior for {selected_whale.get('market_label')} → {p:.0%}")
-                            st.rerun()
-                        else:
-                            st.error("Could not persist override prior.")
+    # Sort: Smart Money %, then Kelly, then |edge|
+    def sort_key(s: Dict[str, Any]):
+        sm = s.get("sm_pct")
+        sm_rank = sm if sm is not None else -1.0
+        return (-sm_rank, -(s.get("kelly_pct", 0.0) or 0.0), -abs(s.get("edge", 0.0)))
 
-# ── Whale Integration Guide ───────────────────────────────────
-st.header("🐋 How to Use Whale Alerts")
-st.markdown("""
-### Whale Monitor + PolyEdge Workflow
+    signals_sorted = sorted(filtered, key=sort_key)
 
-This dashboard shows your **edge signals** based on your probability estimates (priors).
-The whale monitor runs independently and highlights large trades for your review.
+    # Table preview
+    st.markdown("### Ranked Smart Money signals")
+    table_rows = []
+    for s in signals_sorted[:50]:
+        table_rows.append(
+            {
+                "Question": (s.get("question") or "")[:80],
+                "Side": s.get("side"),
+                "SM%": s.get("sm_pct"),
+                "Edge%": (s.get("edge", 0.0) or 0.0) * 100.0,
+                "Kelly%": s.get("kelly_pct", 0.0) or 0.0,
+                "Bet $": s.get("bet_size", 0.0) or 0.0,
+            }
+        )
+    st.dataframe(table_rows, use_container_width=True)
 
-#### Three-Step Integration:
+    # Select a signal
+    st.markdown("### Inspect / log a specific trade")
+    labels = [format_signal_label(s) for s in signals_sorted]
+    idx = st.selectbox(
+        "Select a trade",
+        options=range(len(signals_sorted)),
+        format_func=lambda i: labels[i],
+    )
+    sig = signals_sorted[idx]
 
-1. **Run whale monitor in background:**
-   ```bash
-   python whale_monitor.py  # (in another terminal)
-   ```
-   Watch for `🐋 WHALE:` alerts and copy the LLM prompt.
+    # Display details
+    st.markdown("#### Signal details")
 
-2. **Analyze with LLM:**
-   - Paste the whale prompt into **ChatGPT**, **Claude**, or **Perplexity**.
-   - The LLM will assess whale trade edge for a 1-3 day swing.
-   - Request a probability estimate for the outcome.
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Side", sig["side"])
+        st.metric("Market prob (YES)", f"{sig['market_prob']:.3f}")
+    with col2:
+        st.metric("Your prob (YES)", f"{sig['your_prob']:.3f}")
+        st.metric("Edge (ppts)", f"{(sig['edge'] * 100.0):+.2f}")
+    with col3:
+        st.metric("Kelly (%)", f"{sig['kelly_pct']:.2f}")
+        st.metric("Bet size ($)", f"{sig['bet_size']:.2f}")
 
-3. **Update your prior and refresh:**
-   - If you trust the LLM's analysis, note the new probability estimate.
-   - Update the relevant market in `MARKET_PRIORS` in `model/estimator.py`:
-     ```python
-     MARKET_PRIORS["0xABC123..."] = 0.62  # or use domain-based priors above
-     ```
-   - Refresh this dashboard (press R or wait for auto-refresh).
-   - New edge signals will reflect your updated probability estimates.
+    st.write("**Question**")
+    st.write(sig["question"])
 
-#### Trading Rules:
+    sm_pct = sig.get("sm_pct")
+    if sm_pct is not None:
+        st.caption(f"Smart Money on recommended side: {sm_pct:.1f}%")
 
-- **PolyEdge is the gatekeeper:** Only trade signals with edge ≥ {:.0%}
-- **Whale confirmation:** If a whale aligns with your signal, you may size slightly larger (still ≤ {:.0%} of bankroll per bet)
-- **Whale opposition:** If whale trades opposite your signal, re-check; reconsider or fade based on whale credibility
-- **Contest focus:** 14-day Polymarket contest ranks on **percentage return** — concentrate on fewer, higher-edge trades
+    with st.expander("Raw estimator output"):
+        st.json(sig.get("raw", {}))
 
-#### Key Configuration:
+    # Log trade section
+    st.markdown("#### Log this trade")
+    with st.form("log_trade_form"):
+        size_filled = st.number_input(
+            "Size filled ($)",
+            min_value=0.0,
+            value=float(f"{sig['bet_size']:.2f}"),
+            step=0.5,
+        )
+        price_filled = st.number_input(
+            "Average fill price (YES prob)",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(f"{sig['market_prob']:.3f}"),
+            step=0.01,
+        )
+        note = st.text_input("Notes (optional)", "")
+        submitted = st.form_submit_button("Log trade")
+        if submitted:
+            st.success(
+                f"Logged trade: {sig['side']} on '{sig['question']}' "
+                f"for ${size_filled:.2f} at {price_filled:.3f}."
+            )
 
-- **BANKROLL:** ${:.0f} (set to your actual contest bankroll in `config.py`)
-- **EDGE_THRESHOLD:** {:.0%} (minimum edge to consider trading, in `config.py`)
-- **KELLY_FRACTION:** {:.2f} × Kelly with {:.0%} max bet cap per position
-- **Manual overrides:** Adjust "Your Priors" sliders above to test sensitivity
+    # =================== EVENT / WHALE BROWSERS ===================
 
-#### Pro Tips:
+    st.markdown("---")
+    st.header("All Events (≥ low USD floor)")
 
-- Check whale alerts before trading a signal (they often arrive seconds before big moves).
-- Use whale trades as a **signal confidence booster**, not a replacement for your model.
-- Log trades in the "Log a Trade" section to track calibration and Brier scores.
-- Resolve trades promptly when markets settle to see how well your priors are calibrated.
-""".format(EDGE_THRESHOLD, MAX_BET_FRACTION, BANKROLL, EDGE_THRESHOLD, KELLY_FRACTION, MAX_BET_FRACTION))
+    event_path = os.path.join("data", "events_log.json")
+    scores_path = os.path.join("data", "wallet_scores.json")
+
+    if not (os.path.exists(event_path) and os.path.exists(scores_path)):
+        st.info("Run whale_monitor.py and wallet_tracker.py to populate events and Smart Money data.")
+    else:
+        with open(event_path) as f:
+            events = json.load(f)
+        with open(scores_path) as f:
+            scores = {s["wallet"]: s for s in json.load(f)}
+
+        rows = []
+        for t in events:
+            w = t.get("wallet")
+            s = scores.get(w, {})
+            rows.append({
+                "time": datetime.datetime.fromtimestamp(t.get("timestamp", 0)),
+                "market": t.get("market_label", ""),
+                "wallet": w,
+                "size_usd": float(t.get("size_usd", 0)),
+                "side": t.get("outcome", t.get("side", "")),
+                "price": float(t.get("price", 0)),
+                "sm_label": s.get("label", "Unknown"),
+                "geo_wr": s.get("geo_winrate", s.get("overall_winrate", 0.0)),
+                "geo_trades": s.get("geo_closed", s.get("overall_closed", 0)),
+            })
+
+        df_all = pd.DataFrame(rows)
+        st.dataframe(df_all, use_container_width=True)
+        st.caption("Click column headers (↑/↓) to sort by size, Smart Money label, win rate, etc.")
+
+    st.header("Whale Events (≥ whale USD floor)")
+
+    whale_path = os.path.join("data", "whales_log.json")
+
+    if not os.path.exists(whale_path):
+        st.info("No whale events logged yet.")
+    else:
+        with open(whale_path) as f:
+            whales = json.load(f)
+
+        df_whales = pd.DataFrame(whales)
+        st.dataframe(df_whales, use_container_width=True)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,35 +1,57 @@
 import json
 import re
-import requests
 import os
+import requests
 from typing import Optional, Dict, Any
-from config import LLM_API_KEY, ENABLE_LLM_ANALYSIS, LLM_PROVIDER, LLM_MODEL
+from config import LLM_API_KEY, ENABLE_LLM_ANALYSIS, LLM_MODEL, LLM_BASE_URL
+
+
+def _format_wallet_cred(trade: dict) -> str:
+    label = trade.get("_wallet_label", "Unknown")
+    wr = trade.get("_wallet_win_rate")
+    if not label or label == "Unknown" or wr is None:
+        return "Wallet credibility: Unknown (insufficient historical data)."
+    try:
+        wr_pct = f"{float(wr):.0%}"
+    except Exception:
+        wr_pct = "unknown"
+    return f"Wallet credibility: {label} with historical win rate around {wr_pct} on similar markets."
 
 
 def _build_prompt(market_info: Dict[str, Any], whale_trade: Dict[str, Any], rules: Optional[str] = None) -> str:
     q = market_info.get("question") if isinstance(market_info, dict) else str(market_info)
+    yes_price = market_info.get("yes_price", "unknown") if isinstance(market_info, dict) else "unknown"
+
+    side = whale_trade.get("outcome") or whale_trade.get("side", "?")
+    price = float(whale_trade.get("price", 0.5))
+    size = float(whale_trade.get("size_usd", whale_trade.get("size", 0.0)))
+    wallet_cred = _format_wallet_cred(whale_trade)
+
     prompt = f"""
-You are a market analyst. A large trade occurred on Polymarket.
-Market: {whale_trade.get('market_label')} (id: {whale_trade.get('market_id')})
+You are a prediction market analyst. A large whale trade occurred on Polymarket.
+
+Market: {whale_trade.get('market_label') or q}
 Question: {q}
+Current market YES price: {yes_price}
 Resolution rules: {rules or 'N/A'}
 
-Trade: {whale_trade.get('side')} @ {whale_trade.get('price'):.2%} for ${whale_trade.get('size_usd'):,.0f}
+Trade: {side} @ {price:.2f} for ${size:,.0f}
 Wallet: {whale_trade.get('wallet')}
-Timestamp: {whale_trade.get('timestamp')}
+{wallet_cred}
 
 Task:
-- Provide a short probability estimate for the traded side as a float between 0.0 and 1.0 and explain reasoning.
-- Provide short risk summary and a brief comment describing any perceived edge.
-- Optionally suggest entry and exit prices (absolute YES prices) if relevant.
+- Given the whale trade direction, size, and wallet credibility, estimate the true probability of YES resolving as a float between 0.0 and 1.0.
+- Explain your reasoning briefly.
+- Provide a risk summary.
+- Optionally suggest entry and exit YES prices if a clear edge exists.
 
-Respond preferably with JSON containing keys: p_yes, edge_comment, risks, entry (optional), exit (optional).
+Respond ONLY with valid JSON:
+{{"p_yes": 0.0, "edge_comment": "...", "risks": "...", "entry": null, "exit": null}}
 """.strip()
     return prompt
 
 
 def _parse_json_from_text(text: str) -> Optional[Dict[str, Any]]:
-    # Try to locate a JSON block inside text
     try:
         if text.strip().startswith("{"):
             return json.loads(text)
@@ -42,18 +64,9 @@ def _parse_json_from_text(text: str) -> Optional[Dict[str, Any]]:
 
 
 def analyze_whale(market_info: Dict[str, Any], whale_trade: Dict[str, Any], rules: Optional[str] = None) -> Dict[str, Any]:
-    """Analyze a whale trade via an LLM and return structured output.
-
-    Returns dict:
-      - p_yes: float
-      - edge_comment: str
-      - risks: str
-      - entry: Optional[float]
-      - exit: Optional[float]
-
-    If LLM disabled or key missing, returns a dummy response and logs a warning.
-    """
-    if not ENABLE_LLM_ANALYSIS or not LLM_API_KEY:
+    """Analyze a whale trade via Navigator LLM and return structured output."""
+    api_key = LLM_API_KEY or os.environ.get("NAVIGATOR_API_KEY", "")
+    if not ENABLE_LLM_ANALYSIS or not api_key:
         return {
             "p_yes": 0.5,
             "edge_comment": "LLM analysis disabled or API key missing.",
@@ -66,32 +79,29 @@ def analyze_whale(market_info: Dict[str, Any], whale_trade: Dict[str, Any], rule
     prompt = _build_prompt(market_info, whale_trade, rules)
 
     try:
-        if LLM_PROVIDER.lower() == "openai":
-            url = "https://api.openai.com/v1/chat/completions"
-            headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
-            payload = {
-                "model": LLM_MODEL,
-                "messages": [
-                    {"role": "system", "content": "You are a concise market analyst."},
-                    {"role": "user", "content": prompt},
-                ],
-                "temperature": 0.2,
-                "max_tokens": 400,
-            }
-            r = requests.post(url, headers=headers, json=payload, timeout=30)
-            r.raise_for_status()
-            data = r.json()
-            text = data["choices"][0]["message"]["content"].strip()
-        else:
-            # Unknown provider — fallback to a thin request if supported
-            return {
-                "p_yes": 0.5,
-                "edge_comment": f"Provider {LLM_PROVIDER} not implemented.",
-                "risks": "provider not implemented",
-                "entry": None,
-                "exit": None,
-                "raw": None,
-            }
+        url = f"{LLM_BASE_URL.rstrip('/')}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": LLM_MODEL,
+            "messages": [
+                {"role": "system", "content": "You are a concise prediction market analyst. Always respond with valid JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.2,
+            "max_tokens": 400,
+        }
+        r = requests.post(url, headers=headers, json=payload, timeout=30)
+        r.raise_for_status()
+        text = r.json()["choices"][0]["message"]["content"].strip()
+
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+            text = text.strip()
 
         parsed = _parse_json_from_text(text)
         if parsed:
@@ -109,7 +119,6 @@ def analyze_whale(market_info: Dict[str, Any], whale_trade: Dict[str, Any], rule
                 "raw": text,
             }
 
-        # If no JSON, try to extract a lone probability float from the text
         m = re.search(r"([01]?(?:\.\d+))", text)
         if m:
             try:
@@ -118,7 +127,6 @@ def analyze_whale(market_info: Dict[str, Any], whale_trade: Dict[str, Any], rule
             except Exception:
                 pass
 
-        # fallback dummy
         return {"p_yes": 0.5, "edge_comment": text[:300], "risks": "", "entry": None, "exit": None, "raw": text}
 
     except Exception as e:
