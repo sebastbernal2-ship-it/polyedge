@@ -195,6 +195,14 @@ def main() -> None:
 
     signals_sorted = sorted(filtered, key=sort_key)
 
+    # Build lookup from market id -> signal (for edge in events table)
+    signal_by_id: Dict[str, Dict[str, Any]] = {}
+    for s in signals_sorted:
+        m_id = str(s.get("id") or s.get("market_id") or "")
+        if not m_id:
+            continue
+        signal_by_id[m_id] = s
+
     # Table preview
     st.markdown("### Ranked Smart Money signals")
     table_rows = []
@@ -289,13 +297,21 @@ def main() -> None:
         for t in events:
             w = t.get("wallet")
             s = scores.get(w, {})
+
+            m_id = str(t.get("market_id", ""))
+            q_label = t.get("market_label", "")
+
+            sig_for_event = signal_by_id.get(m_id, {})
+
             rows.append({
                 "time": datetime.datetime.fromtimestamp(t.get("timestamp", 0)),
-                "market": t.get("market_label", ""),
+                "market": q_label,
                 "wallet": w,
                 "size_usd": float(t.get("size_usd", 0)),
                 "side": t.get("outcome", t.get("side", "")),
                 "price": float(t.get("price", 0)),
+                "edge": float(sig_for_event.get("edge", 0.0)) * 100.0,
+                "kelly_pct": sig_for_event.get("kelly_pct", 0.0) or 0.0,
                 "sm_label": s.get("label", "Unknown"),
                 "geo_wr": s.get("geo_winrate", s.get("overall_winrate", 0.0)),
                 "geo_trades": s.get("geo_closed", s.get("overall_closed", 0)),
@@ -303,7 +319,7 @@ def main() -> None:
 
         df_all = pd.DataFrame(rows)
         st.dataframe(df_all, use_container_width=True)
-        st.caption("Click column headers (↑/↓) to sort by size, Smart Money label, win rate, etc.")
+        st.caption("Click column headers (↑/↓) to sort by size, edge, Kelly, Smart Money label, etc.")
 
     st.header("Whale Events (≥ whale USD floor)")
 

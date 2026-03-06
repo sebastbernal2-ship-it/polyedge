@@ -19,7 +19,7 @@ from wallet_tracker import run_scoring  # wallet scorer
 DATA_API = "https://data-api.polymarket.com"
 
 EVENT_MIN_USD = 50        # everything above this is an "event"
-MIN_USD = 2000            # whales for SM / priors
+MIN_USD = 1000            # whales for SM / priors
 POLL_SECONDS = 30
 
 BASE_DATA_DIR = "data"

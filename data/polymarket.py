@@ -87,13 +87,16 @@ import requests
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 
+GAMMA_API = "https://gamma-api.polymarket.com"
+
+
 def fetch_candidate_markets(deadline=None) -> list[dict]:
     """
-    Fetch a broad set of active markets from Polymarket.
-    Very loose filtering: just require id + question; yes_price optional.
+    Fetch active high-volume sports markets (NBA, NHL, CBB, MLS, UFC).
+    Filters by question text keywords, then returns id/question/yes_price.
     """
     params = {
-        "limit": 2000,
+        "limit": 500,
         "active": True,
         "closed": False,
         "order": "volume",
@@ -104,6 +107,17 @@ def fetch_candidate_markets(deadline=None) -> list[dict]:
     if not isinstance(markets, list):
         return []
 
+    # Keywords for US-available sports markets
+    sports_keywords = [
+        "nba",
+        "o/u", "over/under", "total points",
+        "moneyline", "spread",
+        # team names you know appear in your UI
+        "hawks", "bucks", "lakers", "celtics", "knicks", "warriors", "heat",
+        "bulls", "76ers", "suns", "mavericks", "clippers", "nuggets",
+    ]
+
+
     out = []
     for m in markets:
         if not isinstance(m, dict):
@@ -111,8 +125,14 @@ def fetch_candidate_markets(deadline=None) -> list[dict]:
 
         m_id = m.get("conditionId") or m.get("id")
         label = m.get("question") or m.get("title") or m.get("name")
+        if not m_id or not label:
+            continue
 
-        # outcomePrices is usually a JSON string like '["0.23","0.77"]'
+        q_lower = str(label).lower()
+        if not any(k in q_lower for k in sports_keywords):
+            continue  # skip non-sports / geo / politics
+
+        # outcomePrices is usually '["0.23","0.77"]'
         raw_prices = m.get("outcomePrices")
         yes_price = None
         if raw_prices is not None:
@@ -126,9 +146,6 @@ def fetch_candidate_markets(deadline=None) -> list[dict]:
             except Exception:
                 yes_price = None
 
-        if not m_id or not label:
-            continue
-
         out.append(
             {
                 "id": str(m_id),
@@ -139,4 +156,3 @@ def fetch_candidate_markets(deadline=None) -> list[dict]:
         )
 
     return out
-
